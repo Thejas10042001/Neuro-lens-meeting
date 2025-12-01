@@ -1004,12 +1004,6 @@ const MeetingAgent: React.FC = () => {
             <div className="flex items-end h-full pt-1 md:pt-5">
                 {!isLive ? (
                     <div className="flex gap-2">
-                         <button 
-                            onClick={() => startDemoMode()}
-                            className="flex items-center gap-2 bg-gray-700 hover:bg-gray-600 text-gray-300 px-4 py-2.5 rounded-lg font-medium transition-all text-sm"
-                        >
-                            Try Demo
-                        </button>
                         <button 
                             onClick={handleConnectClick}
                             className="flex items-center gap-2 bg-violet-600 hover:bg-violet-500 text-white px-6 py-2.5 rounded-lg font-semibold transition-all shadow-lg shadow-violet-500/20 hover:scale-105 active:scale-95"

@@ -86,9 +86,11 @@ const MeetingGuardian: React.FC = () => {
             try {
                 console.log("Loading FaceAPI models...");
                 await Promise.all([
-                    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+                    // Loading SsdMobilenetv1 for high accuracy detection
+                    faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
                     faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
-                    faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL) // fall back if tiny is bad
+                    // Keep tiny loaded just in case of fallback needs
+                    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL)
                 ]);
                 console.log("FaceAPI loaded. Loading Toxicity...");
                 const model = await toxicity.load(TOXICITY_THRESHOLD, ['identity_attack', 'insult', 'obscene', 'severe_toxicity', 'sexual_explicit', 'threat', 'toxicity']);
@@ -190,9 +192,22 @@ const MeetingGuardian: React.FC = () => {
         if (!videoRef.current || !canvasRef.current || !modelsLoaded || !faceapi) return;
         
         // 1. Detect Faces
-        // Using TinyFaceDetector for speed on larger screen share frames
-        const detections = await faceapi.detectAllFaces(videoRef.current, new faceapi.TinyFaceDetectorOptions())
-            .withFaceExpressions();
+        // Using SsdMobilenetv1 for enhanced accuracy in low light and better occlusion handling
+        // MinConfidence set to 0.4 to pick up faces in dimmer meeting conditions
+        let detections;
+        try {
+            detections = await faceapi.detectAllFaces(
+                videoRef.current, 
+                new faceapi.SsdMobilenetv1Options({ minConfidence: 0.4 })
+            ).withFaceExpressions();
+        } catch (e) {
+            // Fallback to TinyFaceDetector if SSD fails (e.g., memory issues)
+            console.warn("SSD Detection failed, falling back to TinyFace", e);
+            detections = await faceapi.detectAllFaces(
+                videoRef.current, 
+                new faceapi.TinyFaceDetectorOptions()
+            ).withFaceExpressions();
+        }
 
         if (!detections || detections.length === 0) {
             return;
