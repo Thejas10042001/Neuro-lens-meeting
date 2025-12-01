@@ -1,0 +1,7 @@
+{
+  "name": "make 1",
+  "description": "A pitch for a Cognitive State Analytics & Human-AI Co-Learning System that measures attention, stress, and curiosity in real time by analyzing facial micro-expressions, eye tracking, and interaction logs.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
