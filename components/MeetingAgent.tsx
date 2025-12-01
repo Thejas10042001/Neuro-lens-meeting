@@ -63,6 +63,11 @@ const MeetingAgent: React.FC = () => {
   const [meetingUrl, setMeetingUrl] = useState('');
   const [sharingSource, setSharingSource] = useState<string | null>(null);
   
+  // Recording State
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  
   // Group Data (Average)
   const [groupData, setGroupData] = useState<MeetingCognitiveData[]>([]);
   
@@ -633,6 +638,79 @@ const MeetingAgent: React.FC = () => {
           setTranscripts(prev => [...prev, { id: Date.now(), speaker: "System", text: "Speech recognition not supported in this browser.", sentiment: 'neutral', timestamp: new Date().toLocaleTimeString() }]);
       }
   };
+  
+  // Recording Handlers
+  const handleStartRecording = () => {
+      if (!videoRef.current || !videoRef.current.srcObject) return;
+      
+      try {
+          recordedChunksRef.current = [];
+          const stream = videoRef.current.srcObject as MediaStream;
+          
+          const options = { mimeType: 'video/webm; codecs=vp9' };
+          // Fallback mime types if vp9 is not supported
+          const mimeType = MediaRecorder.isTypeSupported(options.mimeType) 
+            ? options.mimeType 
+            : MediaRecorder.isTypeSupported('video/webm') 
+                ? 'video/webm' 
+                : 'video/mp4';
+
+          const mediaRecorder = new MediaRecorder(stream, { mimeType });
+          
+          mediaRecorder.ondataavailable = (event) => {
+              if (event.data && event.data.size > 0) {
+                  recordedChunksRef.current.push(event.data);
+              }
+          };
+
+          mediaRecorder.onstop = () => {
+              const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+              const url = URL.createObjectURL(blob);
+              
+              // Trigger Download
+              const a = document.createElement('a');
+              document.body.appendChild(a);
+              a.style.display = 'none';
+              a.href = url;
+              a.download = `neurolens_recording_${new Date().toISOString().replace(/:/g, '-')}.webm`;
+              a.click();
+              
+              window.URL.revokeObjectURL(url);
+              document.body.removeChild(a);
+              
+              setTranscripts(prev => [...prev, { 
+                  id: Date.now(), 
+                  speaker: "System", 
+                  text: "Recording saved successfully.", 
+                  sentiment: 'neutral', 
+                  timestamp: new Date().toLocaleTimeString() 
+              }]);
+          };
+
+          mediaRecorder.start();
+          mediaRecorderRef.current = mediaRecorder;
+          setIsRecording(true);
+          
+           setTranscripts(prev => [...prev, { 
+              id: Date.now(), 
+              speaker: "System", 
+              text: "Recording started.", 
+              sentiment: 'neutral', 
+              timestamp: new Date().toLocaleTimeString() 
+          }]);
+
+      } catch (e) {
+          console.error("Recording failed", e);
+          setError("Failed to start recording. MediaRecorder not supported.");
+      }
+  };
+
+  const handleStopRecording = () => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+          setIsRecording(false);
+      }
+  };
 
   const startCapture = async () => {
     setIsConfirming(false);
@@ -735,6 +813,12 @@ const MeetingAgent: React.FC = () => {
   };
 
   const stopCapture = () => {
+    // Ensure recording stops if active
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
+        setIsRecording(false);
+    }
+    
     processingRef.current = false;
     setIsLive(false);
     setIsDemo(false);
@@ -935,13 +1019,37 @@ const MeetingAgent: React.FC = () => {
                         </button>
                     </div>
                 ) : (
-                    <button 
-                        onClick={stopCapture}
-                        className="flex items-center gap-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-6 py-2.5 rounded-lg font-semibold transition-all hover:text-red-300"
-                    >
-                        <ZapIcon />
-                        {isDemo ? "Exit Demo" : "Disconnect"}
-                    </button>
+                    <div className="flex gap-2">
+                        {!isDemo && (
+                            <button
+                                onClick={isRecording ? handleStopRecording : handleStartRecording}
+                                className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-semibold transition-all border ${
+                                    isRecording 
+                                        ? 'bg-red-500 text-white border-red-400 hover:bg-red-600'
+                                        : 'bg-gray-800 text-gray-300 border-gray-600 hover:bg-gray-700'
+                                }`}
+                            >
+                                {isRecording ? (
+                                    <>
+                                        <span className="w-3 h-3 bg-white rounded-sm animate-pulse"></span>
+                                        Stop Rec
+                                    </>
+                                ) : (
+                                    <>
+                                        <span className="w-3 h-3 bg-red-500 rounded-full"></span>
+                                        Record Session
+                                    </>
+                                )}
+                            </button>
+                        )}
+                        <button 
+                            onClick={stopCapture}
+                            className="flex items-center gap-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-6 py-2.5 rounded-lg font-semibold transition-all hover:text-red-300"
+                        >
+                            <ZapIcon />
+                            {isDemo ? "Exit Demo" : "Disconnect"}
+                        </button>
+                    </div>
                 )}
             </div>
         </div>
@@ -967,6 +1075,14 @@ const MeetingAgent: React.FC = () => {
                     )}
                     <video ref={videoRef} className={`w-full h-full object-contain ${isDemo ? 'hidden' : 'block'}`} />
                     <canvas ref={canvasRef} className={isDemo ? 'w-full h-full object-contain' : 'hidden'} />
+                    
+                    {/* Recording Indicator Overlay */}
+                    {isRecording && (
+                        <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-full border border-red-500/30 z-50">
+                            <span className="w-2.5 h-2.5 bg-red-500 rounded-full animate-pulse"></span>
+                            <span className="text-xs font-bold text-red-400 tracking-wider">REC</span>
+                        </div>
+                    )}
                     
                     {/* Overlays */}
                     {isLive && participants.map((p, idx) => {
