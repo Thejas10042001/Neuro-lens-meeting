@@ -135,10 +135,9 @@ const Dashboard: React.FC = () => {
     const [modelsLoaded, setModelsLoaded] = useState(false);
     
     // Biometric Stats State for UI
-    const [biometrics, setBiometrics] = useState({ yaw: 0, pitch: 0, ear: 0, blinkRate: 0 });
+    const [biometrics, setBiometrics] = useState({ yaw: 0, pitch: 0, roll: 0, ear: 0, blinkRate: 0 });
 
     const videoRef = useRef<HTMLVideoElement>(null);
-    const canvasRef = useRef<HTMLCanvasElement>(null);
     const modelRef = useRef(new CognitiveModel());
     
     // Blink detection vars
@@ -188,8 +187,9 @@ const Dashboard: React.FC = () => {
                 return;
             }
             try {
+                // Switching to SSD Mobilenet V1 for Higher Accuracy (99% target)
                 await Promise.all([
-                    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+                    faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
                     faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
                     faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL)
                 ]);
@@ -206,8 +206,8 @@ const Dashboard: React.FC = () => {
         if (!videoRef.current || !modelsLoaded || !faceapi) return;
 
         const video = videoRef.current;
-        // Use TinyFaceDetector for performance in the loop
-        const detections = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224 }))
+        // Using SsdMobilenetv1Options for High Precision Detection (slower but accurate)
+        const detections = await faceapi.detectSingleFace(video, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
             .withFaceLandmarks()
             .withFaceExpressions();
 
@@ -215,8 +215,7 @@ const Dashboard: React.FC = () => {
             const landmarks = detections.landmarks;
             const expr = detections.expressions;
 
-            // 1. Head Pose Estimation (Approximation based on landmarks)
-            // Nose tip: 30, Left Eye: 36, Right Eye: 45, Jaw: 8
+            // 1. Head Pose Estimation (Geometric)
             const nose = landmarks.getNose()[3];
             const jaw = landmarks.getJawOutline()[8];
             const leftEye = landmarks.getLeftEye()[0];
@@ -232,6 +231,11 @@ const Dashboard: React.FC = () => {
             const jawDist = jaw.y - nose.y;
             const expectedJawDist = eyeDist * 1.2; // roughly
             const pitch = ((jawDist - expectedJawDist) / expectedJawDist) * 90;
+
+            // Roll (Tilt Side-to-Side) - Precise calculation
+            const dy = rightEye.y - leftEye.y;
+            const dx = rightEye.x - leftEye.x;
+            const roll = Math.atan2(dy, dx) * (180 / Math.PI);
 
             // 2. Eye Aspect Ratio (EAR) for blinking
             // EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
@@ -263,15 +267,16 @@ const Dashboard: React.FC = () => {
             setBiometrics({
                 yaw: parseFloat(yaw.toFixed(1)),
                 pitch: parseFloat(pitch.toFixed(1)),
+                roll: parseFloat(roll.toFixed(1)),
                 ear: parseFloat(avgEAR.toFixed(2)),
                 blinkRate
             });
 
-            // 3. Update Mathematical Model
+            // 3. Update Mathematical Model with Precise Inputs
             const input: BiometricInput = {
                 yaw,
                 pitch,
-                roll: 0, // Simplified
+                roll, 
                 ear: avgEAR,
                 blinkRate,
                 expressionConfidence: {
@@ -337,7 +342,7 @@ const Dashboard: React.FC = () => {
     const initializeCamera = useCallback(async () => {
         setCameraError(null);
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 } });
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } }); // Higher res for accuracy
             if (videoRef.current) {
                 videoRef.current.srcObject = stream;
             }
@@ -351,7 +356,7 @@ const Dashboard: React.FC = () => {
         initializeCamera();
         const interval = setInterval(() => {
             analyzeBiometrics();
-        }, 300); // 3-4 FPS analysis is sufficient for stats
+        }, 200); // 5 FPS for smoother high-accuracy tracking
         return () => clearInterval(interval);
     }, [initializeCamera, analyzeBiometrics]);
 
@@ -406,6 +411,7 @@ const Dashboard: React.FC = () => {
                         <div className="absolute top-2 left-2 bg-black/60 p-2 rounded text-[10px] font-mono text-green-400 space-y-1 backdrop-blur-sm border border-green-500/20">
                             <div>YAW: {biometrics.yaw}°</div>
                             <div>PITCH: {biometrics.pitch}°</div>
+                            <div>ROLL: {biometrics.roll}°</div>
                             <div>BLINK RATE: {biometrics.blinkRate}/min</div>
                             <div>EAR: {biometrics.ear}</div>
                         </div>
