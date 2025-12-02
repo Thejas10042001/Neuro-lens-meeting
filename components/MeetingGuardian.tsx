@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as toxicity from '@tensorflow-models/toxicity';
 import '@tensorflow/tfjs';
@@ -18,6 +19,8 @@ interface ParticipantAnalysis {
     curiosity: number;
     expressions: any; // faceapi.FaceExpressions
     badSign: boolean;
+    bodyLanguage: string; // New field
+    box?: { x: number, y: number, w: number, h: number }; // Visual tracking
 }
 
 interface LogEntry {
@@ -28,6 +31,7 @@ interface LogEntry {
     stress: number;
     curiosity: number;
     badSign: string;
+    bodyLanguage: string;
     toxicLabels: string;
 }
 
@@ -38,12 +42,35 @@ interface ToxicityEvent {
     labels: string[];
 }
 
+// Internal tracking interface
+interface FaceState {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    time: number;
+}
+
+interface TrackedFace {
+    id: number;
+    lastSeen: number; // Timestamp
+    box: { x: number, y: number, w: number, h: number };
+    metrics: {
+        attention: number;
+        stress: number;
+        curiosity: number;
+    };
+    // Motion History for Body Language
+    history: FaceState[];
+    baseline: { w: number, y: number }; // Baseline size/pos to detect leaning/slouching
+    missingFrames: number;
+}
+
 // --- CONSTANTS ---
-// Using rawgit or jsdelivr for models can be CORS sensitive. 
-// We use a known working model path or a relative one if available.
-// For this MVP, we use the Justadudewhohacks repo via JSDelivr/Github Pages.
 const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
 const TOXICITY_THRESHOLD = 0.85;
+const MAX_MISSING_FRAMES = 5; // Increased persistence for robustness
+const MATCH_DISTANCE_THRESHOLD = 150; // Pixel distance to consider it the same face
 
 const MeetingGuardian: React.FC = () => {
     // --- STATE ---
@@ -72,6 +99,10 @@ const MeetingGuardian: React.FC = () => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const analysisIntervalRef = useRef<any>(null);
     const speechRecognitionRef = useRef<any>(null);
+    
+    // Tracking Refs
+    const trackedFacesRef = useRef<TrackedFace[]>([]);
+    const nextPersonIdRef = useRef<number>(1);
 
     // --- INITIALIZATION ---
     useEffect(() => {
@@ -161,7 +192,7 @@ const MeetingGuardian: React.FC = () => {
             startAudioAnalysis(stream);
 
             // Start Video Loop
-            analysisIntervalRef.current = setInterval(analyzeFrame, 1500); // Check every 1.5s
+            analysisIntervalRef.current = setInterval(analyzeFrame, 800); // Slightly faster for motion tracking
             
             // Handle Stop
             stream.getVideoTracks()[0].onended = () => {
@@ -185,92 +216,256 @@ const MeetingGuardian: React.FC = () => {
         
         setIsScreenSharing(false);
         setAiStatus("Not connected");
+        trackedFacesRef.current = []; // Reset tracking
+        setParticipants([]);
+    };
+
+    // Helper: Euclidean distance
+    const getDistance = (x1: number, y1: number, x2: number, y2: number) => {
+        return Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2));
+    };
+
+    // --- BODY LANGUAGE HEURISTICS ---
+    const determineBodyLanguage = (
+        metrics: { attention: number, stress: number, curiosity: number },
+        currentBox: { x: number, y: number, w: number, h: number },
+        history: FaceState[],
+        baseline: { w: number, y: number }
+    ): string => {
+        if (history.length < 3) return "Listening";
+
+        // Calculate motion variance
+        const recent = history.slice(-5);
+        let moveX = 0, moveY = 0;
+        for (let i = 1; i < recent.length; i++) {
+            moveX += Math.abs(recent[i].x - recent[i-1].x);
+            moveY += Math.abs(recent[i].y - recent[i-1].y);
+        }
+        const avgMove = (moveX + moveY) / recent.length;
+
+        // 1. Fidgeting: High erratic movement + High Stress
+        if (avgMove > 15 && metrics.stress > 60) return "Fidgeting";
+
+        // 2. Leaning Forward: Face size increases significantly (>20% larger than baseline)
+        if (currentBox.w > baseline.w * 1.2 && metrics.attention > 50) return "Leaning Forward";
+
+        // 3. Slouching: Face drops lower (>15% down) + Low Attention
+        if (currentBox.y > baseline.y + (baseline.w * 0.3) && metrics.attention < 40) return "Slouching";
+
+        // 4. Nodding / Head Shaking (Simplistic check of directional oscillation)
+        // Check for vertical oscillation (Nodding)
+        let verticalReversals = 0;
+        let horizontalReversals = 0;
+        
+        if (recent.length >= 4) {
+            for(let i=1; i<recent.length-1; i++) {
+                const dy1 = recent[i].y - recent[i-1].y;
+                const dy2 = recent[i+1].y - recent[i].y;
+                if ((dy1 > 0 && dy2 < 0) || (dy1 < 0 && dy2 > 0)) verticalReversals++;
+
+                const dx1 = recent[i].x - recent[i-1].x;
+                const dx2 = recent[i+1].x - recent[i].x;
+                if ((dx1 > 0 && dx2 < 0) || (dx1 < 0 && dx2 > 0)) horizontalReversals++;
+            }
+        }
+
+        if (verticalReversals >= 2 && metrics.attention > 60) return "Nodding";
+        if (horizontalReversals >= 2 && metrics.stress > 50) return "Head Shaking";
+
+        // 5. Arms Crossed / Defensive (Inferred)
+        // High stress + very low motion
+        if (metrics.stress > 75 && avgMove < 2) return "Arms Crossed";
+
+        // Default states
+        if (metrics.attention > 80) return "Engaged";
+        return "Listening";
     };
 
     const analyzeFrame = async () => {
         if (!videoRef.current || !canvasRef.current || !modelsLoaded || !faceapi) return;
         
         // 1. Detect Faces
-        // Using SsdMobilenetv1 for enhanced accuracy in low light and better occlusion handling
-        // MinConfidence set to 0.4 to pick up faces in dimmer meeting conditions
         let detections;
         try {
             detections = await faceapi.detectAllFaces(
                 videoRef.current, 
-                new faceapi.SsdMobilenetv1Options({ minConfidence: 0.4 })
+                new faceapi.SsdMobilenetv1Options({ minConfidence: 0.3 })
             ).withFaceExpressions();
         } catch (e) {
-            // Fallback to TinyFaceDetector if SSD fails (e.g., memory issues)
             console.warn("SSD Detection failed, falling back to TinyFace", e);
             detections = await faceapi.detectAllFaces(
                 videoRef.current, 
-                new faceapi.TinyFaceDetectorOptions()
+                new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 })
             ).withFaceExpressions();
         }
 
-        if (!detections || detections.length === 0) {
-            return;
-        }
+        if (!detections) return;
 
-        const currentParticipants: ParticipantAnalysis[] = [];
         const currentLogs: LogEntry[] = [];
         const newSuggestions: string[] = [];
 
-        // 2. Compute Metrics
-        detections.forEach((d: any, index: number) => {
-            const expr = d.expressions;
+        // --- TRACKING LOGIC ---
+        // Map current detections to a simpler format
+        const detectedObjects = detections.map((d: any) => {
+            const { x, y, width, height } = d.detection.box;
+            const centerX = x + width / 2;
+            const centerY = y + height / 2;
             
+            // Compute raw metrics for this detection
+            const expr = d.expressions;
             // Attention: Neutral + Surprised - (Sad + Fearful/Disgusted)
-            // Normalized roughly 0-100
             let attention = (expr.neutral * 0.8 + expr.surprised * 0.5 + expr.happy * 0.2) * 100;
-            // Penalize for negative/distracted emotions
             attention -= (expr.sad * 30 + expr.fearful * 30 + expr.disgusted * 20); 
             attention = Math.max(0, Math.min(100, attention));
 
-            // Stress: Angry + Fearful + Disgusted + Sad
             let stress = (expr.angry + expr.fearful + expr.disgusted + expr.sad * 0.5) * 100;
             stress = Math.max(0, Math.min(100, stress));
 
-            // Curiosity: Surprised + Happy (eager)
             let curiosity = (expr.surprised + expr.happy) * 100;
             curiosity = Math.max(0, Math.min(100, curiosity));
 
-            // Heuristic Rule for Bad Sign
-            const badSign = stress > 75 && attention < 35;
-            const pId = `Person ${index + 1}`;
-
-            // Add suggestions
-            if (aiSuggestionsEnabled) {
-                if (attention < 35) newSuggestions.push(`⚠️ ${pId} attention is dropping. Ask a question.`);
-                if (stress > 75) newSuggestions.push(`🚨 ${pId} looks stressed. Suggest a break?`);
-                if (curiosity < 20 && attention > 50) newSuggestions.push(`💡 ${pId} seems bored. Switch topics.`);
-            }
-
-            currentParticipants.push({
-                id: pId,
-                attention,
-                stress,
-                curiosity,
+            return {
+                box: { x, y, w: width, h: height },
+                center: { x: centerX, y: centerY },
+                metrics: { attention, stress, curiosity },
                 expressions: expr,
-                badSign
-            });
-
-            // Log Data
-            currentLogs.push({
-                date: new Date().toLocaleDateString(),
-                time: new Date().toLocaleTimeString(),
-                participant: pId,
-                attention: Number(attention.toFixed(1)),
-                stress: Number(stress.toFixed(1)),
-                curiosity: Number(curiosity.toFixed(1)),
-                badSign: badSign ? 'Yes' : 'No',
-                toxicLabels: ''
-            });
+                matched: false
+            };
         });
 
-        setParticipants(currentParticipants);
-        if (newSuggestions.length > 0) setSuggestions(prev => [...newSuggestions.slice(-4), ...prev].slice(0, 10)); // Keep last 10
-        setLogs(prev => [...prev, ...currentLogs].slice(-50)); // Keep last 50 logs in memory
+        // Update existing tracks
+        trackedFacesRef.current.forEach(track => {
+            track.missingFrames++; // Assume missing until matched
+        });
+
+        // Greedy matching of detections to existing tracks
+        detectedObjects.forEach((detection: any) => {
+            let bestMatch = -1;
+            let minDist = MATCH_DISTANCE_THRESHOLD;
+
+            trackedFacesRef.current.forEach((track, tIdx) => {
+                const trackCenter = { 
+                    x: track.box.x + track.box.w / 2, 
+                    y: track.box.y + track.box.h / 2 
+                };
+                const dist = getDistance(detection.center.x, detection.center.y, trackCenter.x, trackCenter.y);
+                
+                if (dist < minDist) {
+                    minDist = dist;
+                    bestMatch = tIdx;
+                }
+            });
+
+            if (bestMatch !== -1) {
+                // Update Track
+                const track = trackedFacesRef.current[bestMatch];
+                track.missingFrames = 0;
+                track.lastSeen = Date.now();
+                
+                // Update History
+                track.history.push({
+                    x: detection.center.x,
+                    y: detection.center.y,
+                    w: detection.box.w,
+                    h: detection.box.h,
+                    time: Date.now()
+                });
+                if (track.history.length > 30) track.history.shift(); // Keep last ~30 secs
+
+                // Update Baseline (Slow moving average)
+                track.baseline.w = (track.baseline.w * 0.99) + (detection.box.w * 0.01);
+                track.baseline.y = (track.baseline.y * 0.99) + (detection.box.y * 0.01);
+
+                // Smooth Box Position (Interpolation to keep it centered and reduce jitter)
+                track.box = {
+                    x: track.box.x * 0.6 + detection.box.x * 0.4,
+                    y: track.box.y * 0.6 + detection.box.y * 0.4,
+                    w: track.box.w * 0.6 + detection.box.w * 0.4,
+                    h: track.box.h * 0.6 + detection.box.h * 0.4
+                };
+                
+                // Smooth metrics (Weighted average)
+                track.metrics.attention = (track.metrics.attention * 0.6) + (detection.metrics.attention * 0.4);
+                track.metrics.stress = (track.metrics.stress * 0.6) + (detection.metrics.stress * 0.4);
+                track.metrics.curiosity = (track.metrics.curiosity * 0.6) + (detection.metrics.curiosity * 0.4);
+                
+                detection.matched = true;
+                detection.trackId = track.id; // Link for UI
+            }
+        });
+
+        // Create new tracks for unmatched detections
+        detectedObjects.forEach((detection: any) => {
+            if (!detection.matched) {
+                const newId = nextPersonIdRef.current++;
+                trackedFacesRef.current.push({
+                    id: newId,
+                    lastSeen: Date.now(),
+                    box: detection.box,
+                    metrics: detection.metrics,
+                    missingFrames: 0,
+                    history: [{
+                        x: detection.center.x,
+                        y: detection.center.y,
+                        w: detection.box.w,
+                        h: detection.box.h,
+                        time: Date.now()
+                    }],
+                    baseline: { w: detection.box.w, y: detection.box.y }
+                });
+                detection.trackId = newId;
+            }
+        });
+
+        // Prune lost tracks
+        trackedFacesRef.current = trackedFacesRef.current.filter(t => t.missingFrames <= MAX_MISSING_FRAMES);
+
+        // --- PREPARE UI STATE ---
+        const uiParticipants: ParticipantAnalysis[] = trackedFacesRef.current.map(t => {
+            const badSign = t.metrics.stress > 75 && t.metrics.attention < 35;
+            const pId = `Person ${t.id}`;
+
+            // Determine Body Language
+            const bodyLang = determineBodyLanguage(t.metrics, t.box, t.history, t.baseline);
+
+            // Add suggestions logic
+            if (aiSuggestionsEnabled && t.missingFrames === 0) {
+                if (t.metrics.attention < 35) newSuggestions.push(`⚠️ ${pId} attention is dropping. Ask a question.`);
+                if (t.metrics.stress > 75) newSuggestions.push(`🚨 ${pId} looks stressed. Suggest a break?`);
+                if (bodyLang === "Fidgeting") newSuggestions.push(`💡 ${pId} is fidgeting. They might be anxious.`);
+                if (bodyLang === "Slouching") newSuggestions.push(`ℹ️ ${pId} is slouching (low engagement).`);
+            }
+            
+            // Only log if actively tracked this frame
+            if (t.missingFrames === 0) {
+                currentLogs.push({
+                    date: new Date().toLocaleDateString(),
+                    time: new Date().toLocaleTimeString(),
+                    participant: pId,
+                    attention: Number(t.metrics.attention.toFixed(1)),
+                    stress: Number(t.metrics.stress.toFixed(1)),
+                    curiosity: Number(t.metrics.curiosity.toFixed(1)),
+                    badSign: badSign ? 'Yes' : 'No',
+                    bodyLanguage: bodyLang,
+                    toxicLabels: ''
+                });
+            }
+
+            return {
+                id: pId,
+                attention: t.metrics.attention,
+                stress: t.metrics.stress,
+                curiosity: t.metrics.curiosity,
+                expressions: {}, 
+                badSign,
+                bodyLanguage: bodyLang,
+                box: t.box
+            };
+        });
+
+        setParticipants(uiParticipants);
+        if (newSuggestions.length > 0) setSuggestions(prev => [...newSuggestions.slice(-4), ...prev].slice(0, 10)); 
+        setLogs(prev => [...prev, ...currentLogs].slice(-50));
     };
 
     // --- AUDIO & TOXICITY ---
@@ -313,6 +508,7 @@ const MeetingGuardian: React.FC = () => {
                             stress: 0,
                             curiosity: 0,
                             badSign: "Yes",
+                            bodyLanguage: "N/A",
                             toxicLabels: detectedLabels.join("; ")
                         }]);
                     }
@@ -331,9 +527,9 @@ const MeetingGuardian: React.FC = () => {
     // --- CSV EXPORT ---
     const downloadCSV = () => {
         if (logs.length === 0) return;
-        const header = ["Date", "Time", "Participant", "Attention", "Stress", "Curiosity", "BadSign", "ToxicLabels"];
+        const header = ["Date", "Time", "Participant", "Attention", "Stress", "Curiosity", "BadSign", "BodyLanguage", "ToxicLabels"];
         const rows = logs.map(l => [
-            l.date, l.time, l.participant, l.attention, l.stress, l.curiosity, l.badSign, `"${l.toxicLabels}"`
+            l.date, l.time, l.participant, l.attention, l.stress, l.curiosity, l.badSign, l.bodyLanguage, `"${l.toxicLabels}"`
         ]);
         const csvContent = [header.join(","), ...rows.map(r => r.join(","))].join("\n");
         const blob = new Blob([csvContent], { type: 'text/csv' });
@@ -479,6 +675,29 @@ const MeetingGuardian: React.FC = () => {
                                     Analyzing participants’ faces & audio in real-time...
                                 </div>
                             )}
+
+                            {/* Render visual tracking boxes */}
+                            {isScreenSharing && participants.map(p => p.box && (
+                                <div key={p.id} style={{
+                                    position: 'absolute',
+                                    border: '2px solid rgba(52, 211, 153, 0.5)',
+                                    left: `${(p.box.x / videoRef.current!.videoWidth) * 100}%`,
+                                    top: `${(p.box.y / videoRef.current!.videoHeight) * 100}%`,
+                                    width: `${(p.box.w / videoRef.current!.videoWidth) * 100}%`,
+                                    height: `${(p.box.h / videoRef.current!.videoHeight) * 100}%`,
+                                    pointerEvents: 'none',
+                                    transition: 'all 0.2s ease-out'
+                                }}>
+                                    <div className="absolute -top-7 left-0 flex flex-col items-start">
+                                        <span className="bg-emerald-600 text-white text-[10px] px-1 rounded mb-0.5">
+                                            {p.id}
+                                        </span>
+                                        <span className="bg-black/70 text-cyan-300 text-[9px] px-1 rounded border border-cyan-500/30 whitespace-nowrap">
+                                            {p.bodyLanguage}
+                                        </span>
+                                    </div>
+                                </div>
+                            ))}
                         </div>
 
                         {/* Controls */}
@@ -517,7 +736,7 @@ const MeetingGuardian: React.FC = () => {
                                             <th className="py-2">User</th>
                                             <th className="py-2">Attn</th>
                                             <th className="py-2">Stress</th>
-                                            <th className="py-2">Sign</th>
+                                            <th className="py-2">Body</th>
                                         </tr>
                                     </thead>
                                     <tbody className="text-sm">
@@ -541,13 +760,7 @@ const MeetingGuardian: React.FC = () => {
                                                     </span>
                                                 </td>
                                                 <td className="py-2">
-                                                    {p.badSign ? (
-                                                        <span className="text-xs text-red-500 font-bold flex items-center gap-1">
-                                                            <ExclamationIcon /> BAD
-                                                        </span>
-                                                    ) : (
-                                                        <span className="text-xs text-gray-600">OK</span>
-                                                    )}
+                                                    <span className="text-xs text-cyan-400">{p.bodyLanguage}</span>
                                                 </td>
                                             </tr>
                                         ))}
@@ -624,6 +837,7 @@ const MeetingGuardian: React.FC = () => {
                                 <th className="p-2">Stress</th>
                                 <th className="p-2">Curiosity</th>
                                 <th className="p-2">Bad Sign?</th>
+                                <th className="p-2">Body Lang</th>
                                 <th className="p-2">Toxic Labels</th>
                             </tr>
                         </thead>
@@ -636,6 +850,7 @@ const MeetingGuardian: React.FC = () => {
                                     <td className="p-2">{l.stress}</td>
                                     <td className="p-2">{l.curiosity}</td>
                                     <td className={`p-2 font-bold ${l.badSign === 'Yes' ? 'text-red-400' : 'text-gray-600'}`}>{l.badSign}</td>
+                                    <td className="p-2 text-cyan-300">{l.bodyLanguage}</td>
                                     <td className="p-2 text-red-300">{l.toxicLabels}</td>
                                 </tr>
                             ))}
